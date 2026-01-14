@@ -1,7 +1,8 @@
 from django.urls import path
-from .views import upload_notes_csv, upload_s3_csv
+from .views import import_admin_csv, import_notes_csv
 
 urlpatterns = [
-    path("upload-notes/", upload_notes_csv),
-    path("upload-s3/", upload_s3_csv),
+    path('import-csv/', import_notes_csv),
+    path('import-admin/', import_admin_csv),  # <--- NOUVELLE ROUTE
+    path('import-csv/', import_notes_csv),
 ]

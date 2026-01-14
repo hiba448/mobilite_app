@@ -1,139 +1,255 @@
 import csv
 import io
-
 from django.db import transaction
-from rest_framework.decorators import api_view, permission_classes
+from django.shortcuts import render
+from rest_framework.decorators import api_view, permission_classes, parser_classes
+from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.permissions import AllowAny
 
+from academic.models import Etudiant, Module, NoteModule
+from selection.models import DossierEtudiant
 from mobility.models import Campagne
-from academic.models import Etudiant, Module, NoteModule, MoyenneS3  # adapte si noms diffèrent
-from .permissions import IsScolariteOrSRI
 
+# --- FONCTIONS UTILITAIRES ---
 
 def get_active_campagne():
     return Campagne.objects.filter(active=True).first()
 
+def parse_bool(value):
+    """
+    Transforme n'importe quelle entrée (OUI, oui, Yes, 1, True) en Booléen Python.
+    Retourne False par défaut.
+    """
+    if not value:
+        return False
+    clean_val = str(value).strip().upper()
+    return clean_val in ['OUI', 'TRUE', '1', 'YES', 'Y', 'VRAI']
 
+# =========================================================
+# 1. IMPORT INFOS ADMINISTRATIVES (Redoublement / Blâme)
+# =========================================================
 @api_view(["POST"])
-@permission_classes([IsScolariteOrSRI])
-def upload_notes_csv(request):
+@permission_classes([AllowAny]) 
+@parser_classes([MultiPartParser, FormParser])
+def import_admin_csv(request):
     """
-    CSV attendu: cne,nom_mod,note
+    Fichier attendu : infos_admin.csv
+    Colonnes : CNE;Redoublant_1A;Blame
+    Action : Met à jour (force) les statuts administratifs.
     """
+    file_obj = request.FILES.get('file')
+    if not file_obj:
+        return Response({"error": "Aucun fichier fourni."}, status=400)
+
     campagne = get_active_campagne()
     if not campagne:
-        return Response({"detail": "Aucune campagne active."}, status=400)
+        return Response({"error": "Aucune campagne active."}, status=400)
 
-    f = request.FILES.get("file")
-    if not f:
-        return Response({"detail": "Fichier manquant (champ 'file')."}, status=400)
+    try:
+        # 1. Lecture avec nettoyage du BOM (utf-8-sig)
+        decoded_file = file_obj.read().decode('utf-8-sig').splitlines()
+        reader = csv.DictReader(decoded_file, delimiter=';')
+        
+        # 2. Nettoyage des noms de colonnes (enlève les espaces autour)
+        if reader.fieldnames:
+            reader.fieldnames = [name.strip() for name in reader.fieldnames]
 
-    data = f.read().decode("utf-8-sig")  # gère BOM
-    reader = csv.DictReader(io.StringIO(data))
+        # 3. Vérification basique
+        if 'CNE' not in reader.fieldnames:
+            return Response({"error": f"Colonne 'CNE' introuvable. Colonnes lues : {reader.fieldnames}"}, status=400)
 
-    required = {"cne", "nom_mod", "note"}
-    if not required.issubset(set([h.strip() for h in reader.fieldnames or []])):
-        return Response({"detail": f"Colonnes requises: {sorted(required)}"}, status=400)
+        updated_count = 0
+        errors = []
 
-    created, updated, errors = 0, 0, []
+        print("--- DÉBUT IMPORT ADMIN ---")
 
-    with transaction.atomic():
-        for i, row in enumerate(reader, start=2):  # ligne 1 = header
-            try:
-                cne = (row.get("cne") or "").strip()
-                nom_mod = (row.get("nom_mod") or "").strip()
-                note_raw = (row.get("note") or "").strip().replace(",", ".")
+        with transaction.atomic():
+            for i, row in enumerate(reader, start=1):
+                cne = row.get('CNE', '').strip()
+                if not cne: continue # Ligne vide
 
-                if not cne or not nom_mod or note_raw == "":
-                    raise ValueError("Valeur vide")
+                etudiant = Etudiant.objects.filter(cne=cne).first()
+                if not etudiant:
+                    # errors.append(f"Ligne {i}: CNE {cne} introuvable.")
+                    continue
 
-                note = float(note_raw)
-                if note < 0 or note > 20:
-                    raise ValueError("Note hors [0..20]")
+                # Lecture des valeurs
+                raw_red = row.get('Redoublant_1A', '')
+                raw_blame = row.get('Blame', '')
+                
+                is_red = parse_bool(raw_red)
+                has_blame = parse_bool(raw_blame)
 
-                etu = Etudiant.objects.filter(cne=cne).first()
-                if not etu:
-                    raise ValueError(f"Etudiant introuvable: {cne}")
+                # DEBUG : On affiche les changements critiques
+                if is_red or has_blame:
+                    print(f"🔴 ADMIN {cne} -> Redoublant: {is_red} | Blâme: {has_blame}")
 
-                mod, _ = Module.objects.get_or_create(nom=nom_mod)
+                # MISE À JOUR STRICTE (update_or_create)
+                # On force la valeur lue dans le fichier
+                dossier, created = DossierEtudiant.objects.update_or_create(
+                    campagne=campagne,
+                    etudiant=etudiant,
+                    defaults={
+                        'redoublement_a1': is_red,
+                        'blame': has_blame
+                    }
+                )
+                updated_count += 1
 
-                obj, was_created = NoteModule.objects.update_or_create(
-                    etudiant=etu,
-                    module=mod,
-                    campagne=campagne,   # si ton modèle NoteModule a campagne
-                    defaults={"note": note},
+        print(f"--- FIN IMPORT ADMIN : {updated_count} dossiers traités ---")
+        return Response({
+            "message": f"Succès : {updated_count} dossiers administratifs mis à jour.",
+            "errors": errors
+        }, status=200)
+
+    except Exception as e:
+        print(f"ERREUR CRITIQUE ADMIN: {e}")
+        return Response({"error": str(e)}, status=500)
+
+
+# =========================================================
+# 2. IMPORT NOTES (Académique pur)
+# =========================================================
+@api_view(["POST"])
+@permission_classes([AllowAny]) 
+@parser_classes([MultiPartParser, FormParser])
+def import_notes_csv(request):
+    """
+    Fichier attendu : notes.csv
+    Colonnes : CNE;Nom_Module;Type_Module;Note
+    Action : Ajoute les notes, crée le dossier si inexistant (mais SANS toucher aux flags admin).
+    """
+    file_obj = request.FILES.get('file')
+    if not file_obj:
+        return Response({"error": "Aucun fichier fourni."}, status=400)
+
+    campagne = get_active_campagne()
+    if not campagne:
+        return Response({"error": "Aucune campagne active."}, status=400)
+
+    try:
+        decoded_file = file_obj.read().decode('utf-8-sig').splitlines()
+        reader = csv.DictReader(decoded_file, delimiter=';')
+        
+        if reader.fieldnames:
+            reader.fieldnames = [name.strip() for name in reader.fieldnames]
+
+        count_notes = 0
+        errors = []
+
+        print("--- DÉBUT IMPORT NOTES ---")
+
+        with transaction.atomic():
+            for i, row in enumerate(reader, start=1):
+                cne = row.get('CNE', '').strip()
+                if not cne: continue
+
+                etudiant = Etudiant.objects.filter(cne=cne).first()
+                if not etudiant:
+                    continue
+
+                try:
+                    note_val = float(row['Note'].replace(',', '.'))
+                    mod_nom = row['Nom_Module'].strip()
+                    type_mod = row['Type_Module'].upper().strip()
+                except ValueError:
+                    errors.append(f"Ligne {i}: Erreur format note pour {cne}")
+                    continue
+
+                # 1. Dossier : On s'assure qu'il existe, MAIS ON NE L'ÉCRASE PAS
+                # get_or_create ne touchera pas à redoublement_a1 ni blame s'ils existent déjà
+                DossierEtudiant.objects.get_or_create(
+                    campagne=campagne, 
+                    etudiant=etudiant
                 )
 
-                if was_created:
-                    created += 1
-                else:
-                    updated += 1
+                # 2. Module
+                module, _ = Module.objects.get_or_create(
+                    nom=mod_nom,
+                    defaults={
+                        'is_pfa': (type_mod == 'PFA'),
+                        'is_tc': (type_mod == 'TC'),
+                        'is_specialite': (type_mod == 'SPEC')
+                    }
+                )
 
-            except Exception as e:
-                errors.append({"line": i, "error": str(e), "row": row})
+                # 3. Note
+                NoteModule.objects.update_or_create(
+                    campagne=campagne, etudiant=etudiant, module=module,
+                    defaults={'note': note_val}
+                )
+                count_notes += 1
 
-    return Response(
-        {"ok": True, "created": created, "updated": updated, "errors": errors},
-        status=status.HTTP_200_OK
-    )
+        print(f"--- FIN IMPORT NOTES : {count_notes} notes traitées ---")
+        return Response({
+            "message": f"Succès : {count_notes} notes importées.", 
+            "errors": errors
+        }, status=200)
+
+    except Exception as e:
+        print(f"ERREUR CRITIQUE NOTES: {e}")
+        return Response({"error": str(e)}, status=500)
 
 
+# =========================================================
+# 3. IMPORT S3 (Passe 3)
+# =========================================================
 @api_view(["POST"])
-@permission_classes([IsScolariteOrSRI])
+@permission_classes([AllowAny])
 def upload_s3_csv(request):
     """
-    CSV attendu: cne,moy_s3_avant_rattrapage
+    Format : cne,moy_s3_avant_rattrapage (virgule ou point-virgule acceptés)
     """
     campagne = get_active_campagne()
-    if not campagne:
-        return Response({"detail": "Aucune campagne active."}, status=400)
+    if not campagne: return Response({"detail": "Aucune campagne active."}, status=400)
 
     f = request.FILES.get("file")
-    if not f:
-        return Response({"detail": "Fichier manquant (champ 'file')."}, status=400)
+    if not f: return Response({"detail": "Fichier manquant."}, status=400)
 
-    data = f.read().decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(data))
+    try:
+        data = f.read().decode("utf-8-sig")
+        # Petite astuce pour gérer virgule ET point-virgule
+        if ';' in data.splitlines()[0]:
+            reader = csv.DictReader(io.StringIO(data), delimiter=';')
+        else:
+            reader = csv.DictReader(io.StringIO(data), delimiter=',')
 
-    required = {"cne", "moy_s3_avant_rattrapage"}
-    if not required.issubset(set([h.strip() for h in reader.fieldnames or []])):
-        return Response({"detail": f"Colonnes requises: {sorted(required)}"}, status=400)
+        # Nettoyage header
+        if reader.fieldnames:
+            reader.fieldnames = [name.strip() for name in reader.fieldnames]
 
-    created, updated, errors = 0, 0, []
+        updated = 0
+        with transaction.atomic():
+            for row in reader:
+                # On cherche la clé insensible à la casse
+                cne_key = next((k for k in row.keys() if k.lower() == 'cne'), None)
+                moy_key = next((k for k in row.keys() if 'moy' in k.lower()), None)
 
-    with transaction.atomic():
-        for i, row in enumerate(reader, start=2):
-            try:
-                cne = (row.get("cne") or "").strip()
-                moy_raw = (row.get("moy_s3_avant_rattrapage") or "").strip().replace(",", ".")
+                if not cne_key or not moy_key: continue
 
-                if not cne or moy_raw == "":
-                    raise ValueError("Valeur vide")
+                cne = row[cne_key].strip()
+                moy_raw = row[moy_key].strip().replace(",", ".")
 
-                moy = float(moy_raw)
-                if moy < 0 or moy > 20:
-                    raise ValueError("Moyenne hors [0..20]")
+                if cne and moy_raw:
+                    etu = Etudiant.objects.filter(cne=cne).first()
+                    if etu:
+                        DossierEtudiant.objects.update_or_create(
+                            etudiant=etu, campagne=campagne,
+                            defaults={"moyenne_s3_avant_rattrapage": float(moy_raw)}
+                        )
+                        updated += 1
+        
+        return Response({"ok": True, "created": updated}, status=200)
+    except Exception as e:
+        return Response({"detail": str(e)}, status=500)
 
-                etu = Etudiant.objects.filter(cne=cne).first()
-                if not etu:
-                    raise ValueError(f"Etudiant introuvable: {cne}")
 
-                obj, was_created = MoyenneS3.objects.update_or_create(
-                    etudiant=etu,
-                    campagne=campagne,
-                    defaults={"moy_s3_avant_rattrapage": moy},
-                )
-
-                if was_created:
-                    created += 1
-                else:
-                    updated += 1
-
-            except Exception as e:
-                errors.append({"line": i, "error": str(e), "row": row})
-
-    return Response(
-        {"ok": True, "created": created, "updated": updated, "errors": errors},
-        status=status.HTTP_200_OK
-    )
+# =========================================================
+# 4. ROUTE OBSOLÈTE (Pour éviter les crashs d'URL)
+# =========================================================
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def upload_notes_csv_old(request):
+    return Response({"detail": "Cette route n'existe plus. Utilisez import-csv."}, status=400)

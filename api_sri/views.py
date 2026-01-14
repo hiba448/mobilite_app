@@ -199,15 +199,24 @@ def sri_details(request, data_type):
                 "nom": r.etudiant.nom,
                 "prenom": r.etudiant.prenom,
                 "filiere": r.etudiant.filiere.nom if r.etudiant.filiere else "N/A",
-                
-                # ✅ CORRECTION ICI : score_passe1 -> moyenne_a1_sans_pfa
                 "score_1": r.moyenne_a1_sans_pfa, 
-                
-                # ✅ CORRECTION ICI : motif_rejet -> motif_refus
-                "motif": r.motif_refus or "OK"
+                "motif": "OK"
             })
 
-    # 2. Classement Global
+    # 2. Liste des Recalés (C'EST CE BLOC QUI MANQUAIT)
+    elif data_type == "recales":
+        results = ResultatPasse1.objects.filter(campagne=c, eligible=False).select_related('etudiant__filiere')
+        for r in results:
+            data.append({
+                "cne": r.etudiant.cne,
+                "nom": r.etudiant.nom,
+                "prenom": r.etudiant.prenom,
+                "filiere": r.etudiant.filiere.nom if r.etudiant.filiere else "N/A",
+                "score_1": r.moyenne_a1_sans_pfa,
+                "motif": r.motif_refus  # Affiche la raison (Redoublement, Note < 12.5...)
+            })
+
+    # 3. Classement Global
     elif data_type == "classement":
         results = ResultatPasse3.objects.filter(campagne=c).order_by('rang').select_related('etudiant__filiere')
         for r in results:
@@ -216,17 +225,13 @@ def sri_details(request, data_type):
                 "cne": r.etudiant.cne,
                 "nom": f"{r.etudiant.nom} {r.etudiant.prenom}",
                 "filiere": r.etudiant.filiere.nom if r.etudiant.filiere else "N/A",
-                
-                # ✅ CORRECTION ICI : score_total -> note_selection
                 "score_total": r.note_selection,
             })
 
-    # 3. Affectations Finales
+    # 4. Affectations Finales
     elif data_type == "affectations":
-        # Note: AffectationFinale n'a pas de champ 'offre', mais 'partenaire' et 'type_mobilite'
         results = AffectationFinale.objects.filter(campagne=c).select_related('etudiant', 'partenaire')
         for r in results:
-            # Construction manuelle de la destination car pas d'objet 'Offre' direct
             dest = "-"
             if r.partenaire:
                 dest = f"{r.partenaire.nom_ecole} ({r.type_mobilite})"
@@ -239,50 +244,6 @@ def sri_details(request, data_type):
             })
 
     return Response(data, status=200)
-# ... vos autres imports ...
-from selection.models import DossierEtudiant, ConvocationEntretien # Assurez-vous d'importer tous les modèles
-
-@api_view(["POST"])
-@permission_classes([IsSRI])
-def sri_reset_campaign(request):
-    """
-    DANGER : Supprime tous les résultats calculés pour la campagne active.
-    Ne supprime PAS les Desiderata ni les Notes, pour permettre de relancer l'algo.
-    """
-    c = get_active_campagne()
-    if not c:
-        return Response({"detail": "Aucune campagne active."}, status=400)
-
-    try:
-        # 1. Supprimer les Convocations (Passe 4)
-        count_convoc = ConvocationEntretien.objects.filter(campagne=c).delete()[0]
-
-        # 2. Supprimer les Affectations Finales (Passe 3 FIFO)
-        count_aff = AffectationFinale.objects.filter(campagne=c).delete()[0]
-
-        # 3. Supprimer le Classement (Passe 3 Rank)
-        count_rank = ResultatPasse3.objects.filter(campagne=c).delete()[0]
-
-        # 4. Supprimer les résultats d'éligibilité (Passe 1)
-        count_p1 = ResultatPasse1.objects.filter(campagne=c).delete()[0]
-        
-        # 5. Supprimer les Dossiers Administratifs (Optionnel, recréés en Passe 1)
-        count_dossiers = DossierEtudiant.objects.filter(campagne=c).delete()[0]
-
-        msg = (
-            f"Réinitialisation réussie ✅\n"
-            f"- {count_convoc} Convocations supprimées\n"
-            f"- {count_aff} Affectations supprimées\n"
-            f"- {count_rank} Rangs supprimés\n"
-            f"- {count_p1} Résultats éligibilité supprimés\n"
-            f"- {count_dossiers} Dossiers supprimés"
-        )
-        return Response({"ok": True, "detail": msg}, status=200)
-
-    except Exception as e:
-        return Response({"ok": False, "detail": str(e)}, status=500)
-
-# Ajoutez ces imports si manquants
 from selection.models import ConvocationEntretien, ResultatEntretien, AffectationFinale
 
 @api_view(["GET"])
@@ -425,3 +386,43 @@ def comite_save_note(request):
 
     except Exception as e:
         return Response({"ok": False, "error": str(e)}, status=500)
+
+from selection.models import DossierEtudiant, ConvocationEntretien # Assurez-vous d'importer tous les modèles
+
+@api_view(["POST"])
+@permission_classes([IsSRI])
+def sri_reset_campaign(request):
+    """
+    DANGER : Supprime tous les résultats calculés pour la campagne active.
+    Ne supprime PAS les Desiderata ni les Notes, pour permettre de relancer l'algo.
+    """
+    c = get_active_campagne()
+    if not c:
+        return Response({"detail": "Aucune campagne active."}, status=400)
+
+    try:
+        # 1. Supprimer les Convocations (Passe 4)
+        count_convoc = ConvocationEntretien.objects.filter(campagne=c).delete()[0]
+
+        # 2. Supprimer les Affectations Finales (Passe 3 FIFO)
+        count_aff = AffectationFinale.objects.filter(campagne=c).delete()[0]
+
+        # 3. Supprimer le Classement (Passe 3 Rank)
+        count_rank = ResultatPasse3.objects.filter(campagne=c).delete()[0]
+
+        # 4. Supprimer les résultats d'éligibilité (Passe 1)
+        count_p1 = ResultatPasse1.objects.filter(campagne=c).delete()[0]
+        
+
+        msg = (
+            f"Réinitialisation réussie ✅\n"
+            f"- {count_convoc} Convocations supprimées\n"
+            f"- {count_aff} Affectations supprimées\n"
+            f"- {count_rank} Rangs supprimés\n"
+            f"- {count_p1} Résultats éligibilité supprimés\n"
+
+        )
+        return Response({"ok": True, "detail": msg}, status=200)
+
+    except Exception as e:
+        return Response({"ok": False, "detail": str(e)}, status=500)

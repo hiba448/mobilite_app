@@ -19,6 +19,7 @@ from .views import (
     sri_reset_campaign,
     comite_dashboard,
     comite_save_note,
+    sri_reset_campaign,
 )
 
 urlpatterns = [
