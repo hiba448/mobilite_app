@@ -56,7 +56,7 @@ def upload_notes_csv(request):
                 if not etu:
                     raise ValueError(f"Etudiant introuvable: {cne}")
 
-                mod, _ = Module.objects.get_or_create(nom_mod=nom_mod)
+                mod, _ = Module.objects.get_or_create(nom=nom_mod)
 
                 obj, was_created = NoteModule.objects.update_or_create(
                     etudiant=etu,

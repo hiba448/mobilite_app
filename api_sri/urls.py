@@ -1,4 +1,5 @@
 from django.urls import path
+
 from .views import (
     sri_dashboard,
 
@@ -14,6 +15,10 @@ from .views import (
 
     sri_open_desiderata,
     sri_close_desiderata,
+    sri_dashboard, sri_details,
+    sri_reset_campaign,
+    comite_dashboard,
+    comite_save_note,
 )
 
 urlpatterns = [
@@ -31,4 +36,8 @@ urlpatterns = [
 
     path("desiderata/open/", sri_open_desiderata),
     path("desiderata/close/", sri_close_desiderata),
+    path("details/<str:data_type>/", sri_details),
+    path("reset-all/", sri_reset_campaign),
+    path("comite/dashboard/", comite_dashboard),
+    path("comite/save/", comite_save_note),
 ]

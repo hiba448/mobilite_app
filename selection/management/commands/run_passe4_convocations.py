@@ -1,10 +1,10 @@
 from django.core.management.base import BaseCommand
 from mobility.models import Campagne
-from selection.models import ConvocationEntretien, ResultatPasse3, AffectationFinale
+from selection.models import ConvocationEntretien, AffectationFinale
 
 
 class Command(BaseCommand):
-    help = "Passe 4: générer les convocations (FIFO d'abord, puis attente si besoin)"
+    help = "Passe 4: Générer les convocations (Affectés + Liste d'attente)"
 
     def handle(self, *args, **options):
         campagne = Campagne.objects.filter(active=True).first()
@@ -12,27 +12,50 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR("Aucune campagne active."))
             return
 
-        # candidats pré-affectés (NON_PUBLIE) + liste d'attente
-        fifo = AffectationFinale.objects.filter(campagne=campagne, statut="NON_PUBLIE").select_related("etudiant")
-        attente = AffectationFinale.objects.filter(campagne=campagne, statut="LISTE_ATTENTE").select_related("etudiant")
+        self.stdout.write("--- Génération des Convocations ---")
 
-        if not fifo.exists() and not attente.exists():
-            self.stdout.write(self.style.ERROR("Aucune pré-affectation trouvée. Lance d'abord run_passe3_fifo."))
-            return
+        # 1. On récupère les AFFECTE (ceux retenus par le FIFO)
+        # Note: On inclut "NON_PUBLIE" au cas où tu aurais changé le script précédent
+        candidats_retenus = AffectationFinale.objects.filter(
+            campagne=campagne, 
+            statut__in=["AFFECTE", "NON_PUBLIE"]
+        ).select_related("etudiant")
 
-        created = 0
+        # 2. On convoque aussi la LISTE D'ATTENTE (Règle 4.1.1 : "plus le/les suivants") 
+        # C'est utile pour gérer les désistements potentiels dès maintenant.
+        candidats_attente = AffectationFinale.objects.filter(
+            campagne=campagne, 
+            statut="LISTE_ATTENTE"
+        ).select_related("etudiant")
 
-        # convoquer tous les FIFO (version simple)
-        for a in fifo:
-            _, was_created = ConvocationEntretien.objects.get_or_create(campagne=campagne, etudiant=a.etudiant)
-            if was_created:
-                created += 1
+        total_convoques = 0
 
-        # option: convoquer aussi une partie de la liste d'attente (backup)
-        # Ici on convoque tous les attente (simple), tu peux limiter après.
-        for a in attente:
-            _, was_created = ConvocationEntretien.objects.get_or_create(campagne=campagne, etudiant=a.etudiant)
-            if was_created:
-                created += 1
+        # Fonction locale pour traiter une liste
+        def convoquer_liste(liste_query, est_liste_attente=False):
+            count = 0
+            for aff in liste_query:
+                # Créer la convocation
+                msg = "Vous êtes sur liste d'attente." if est_liste_attente else "Vous êtes pré-sélectionné."
+                
+                convoc, created = ConvocationEntretien.objects.get_or_create(
+                    campagne=campagne, 
+                    etudiant=aff.etudiant,
+                    defaults={"statut_convocation": "CONVOQUE", "message": msg}
+                )
 
-        self.stdout.write(self.style.SUCCESS(f"Convocations générées ✅ | nouvelles convocations: {created}"))
+                # IMPORTANT : On met à jour le statut public pour le Dashboard Étudiant
+                if aff.statut != "CONVOQUE":
+                    aff.statut = "CONVOQUE"
+                    aff.save()
+                
+                if created:
+                    count += 1
+            return count
+
+        # Exécution
+        nb_retenus = convoquer_liste(candidats_retenus, est_liste_attente=False)
+        nb_attente = convoquer_liste(candidats_attente, est_liste_attente=True)
+
+        self.stdout.write(self.style.SUCCESS(f"Terminé ✅"))
+        self.stdout.write(f"Candidats retenus convoqués : {nb_retenus}")
+        self.stdout.write(f"Liste d'attente convoquée   : {nb_attente}")

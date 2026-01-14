@@ -64,6 +64,8 @@ class ResultatPasse3(models.Model):
 
     note_selection = models.FloatField()
     rang = models.PositiveIntegerField(null=True, blank=True)
+    note_s1 = models.FloatField(null=True, blank=True)
+    note_s3 = models.FloatField(null=True, blank=True)
 
     # Statut avant oral (FIFO / attente / non retenu)
     statut = models.CharField(
@@ -86,31 +88,39 @@ class ResultatPasse3(models.Model):
 class ConvocationEntretien(models.Model):
     campagne = models.ForeignKey('mobility.Campagne', on_delete=models.CASCADE)
     etudiant = models.ForeignKey('academic.Etudiant', on_delete=models.CASCADE)
-
+    
+    # Ajoutez ces champs s'ils manquent :
     date_entretien = models.DateTimeField(null=True, blank=True)
-    convoque = models.BooleanField(default=True)
-
-    class Meta:
-        unique_together = ('campagne', 'etudiant')
+    lieu = models.CharField(max_length=255, null=True, blank=True)
+    
+    # ✅ AJOUT POUR LE SCRIPT PASSE 4
+    statut_convocation = models.CharField(max_length=50, default="CONVOQUE") 
+    message = models.TextField(null=True, blank=True)
 
     def __str__(self):
-        return f"Convocation {self.etudiant.cne}"
-
+        return f"Convocation {self.etudiant} - {self.statut_convocation}"
 
 class ResultatEntretien(models.Model):
     campagne = models.ForeignKey('mobility.Campagne', on_delete=models.CASCADE)
     etudiant = models.ForeignKey('academic.Etudiant', on_delete=models.CASCADE)
 
     present = models.BooleanField(default=True)
+    
+    # ✅ AJOUTS POUR LE DASHBOARD COMITÉ
+    score = models.FloatField(default=0)  # Note sur 20 (Motivation)
+    commentaire = models.TextField(null=True, blank=True) # Avis du jury
+
+    # Champs booléens optionnels (vous pouvez les garder si vous voulez)
     engagement_financier_ok = models.BooleanField(default=False)
     motivation_ok = models.BooleanField(default=False)
 
     decision = models.CharField(
         max_length=20,
         default='EN_ATTENTE',
+        # On aligne les choix avec ce que le Front envoie (VALIDE / REFUSE)
         choices=[
-            ('RETENU', 'Retenu'),
-            ('ELIMINE', 'Elimine'),
+            ('VALIDE', 'Validé'),
+            ('REFUSE', 'Refusé'),
             ('EN_ATTENTE', 'En attente'),
         ],
     )
@@ -120,9 +130,6 @@ class ResultatEntretien(models.Model):
 
     def __str__(self):
         return f"Oral {self.etudiant.cne} {self.decision}"
-    
-    def __str__(self):
-     return f"{self.etudiant.cne} - {self.decision}"
 
 
 class AffectationFinale(models.Model):
@@ -145,6 +152,8 @@ class AffectationFinale(models.Model):
             ('LISTE_ATTENTE', 'Liste attente'),
             ('NON_RETENU', 'Non retenu'),
             ('NON_PUBLIE', 'Non publie'),
+            ('CONVOQUE', 'Convoqué Entretien'),     # ✅ Ajouté pour cohérence
+            ('ADMIS_DEFINITIF', 'Admis Définitif'), # ✅ Ajouté pour la finalisation
         ],
     )
 
@@ -153,6 +162,3 @@ class AffectationFinale(models.Model):
 
     def __str__(self):
         return f"Final {self.etudiant.cne} {self.statut}"
-    
-    def __str__(self):
-     return f"{self.etudiant.cne} - {self.statut}"

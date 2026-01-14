@@ -6,7 +6,14 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from mobility.models import Campagne, Desiderata, Alignement
-from selection.models import ResultatPasse1, ResultatPasse3, AffectationFinale
+# ✅ MODIFICATION ICI : On ajoute ConvocationEntretien et ResultatEntretien
+from selection.models import (
+    ResultatPasse1, 
+    ResultatPasse3, 
+    AffectationFinale, 
+    ConvocationEntretien, 
+    ResultatEntretien
+)
 from academic.models import Etudiant
 
 from .serializers import StudentMeSerializer, DesiderataSerializer
@@ -80,6 +87,78 @@ def student_me(request):
         "deadline_desiderata_open": deadline_open,
     }
     return Response(StudentMeSerializer(payload).data)
+
+
+# ✅ NOUVELLE VUE POUR LE DASHBOARD COMPLET (TIMELINE)
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def student_dashboard(request):
+    """
+    Renvoie l'état complet du dossier étudiant (Passe 1, 3, 4)
+    pour l'affichage Timeline.
+    """
+    user = request.user
+    etu = Etudiant.objects.filter(user=user).select_related("filiere").first()
+    
+    if not etu:
+        return Response({"error": "Profil étudiant non trouvé"}, status=404)
+
+    c = get_active_campaign()
+    if not c:
+        return Response({"error": "Aucune campagne active"}, status=404)
+
+    # 1. Récupération Passe 1 (Éligibilité)
+    p1 = ResultatPasse1.objects.filter(campagne=c, etudiant=etu).first()
+    
+    # 2. Récupération Passe 3 (Classement & Note)
+    p3 = ResultatPasse3.objects.filter(campagne=c, etudiant=etu).first()
+    
+    # 3. Récupération Affectation Finale (FIFO / Résultat Final)
+    aff = AffectationFinale.objects.filter(campagne=c, etudiant=etu).select_related("partenaire").first()
+    
+    # 4. Récupération Entretien (Convocation & Résultat)
+    convoc = ConvocationEntretien.objects.filter(campagne=c, etudiant=etu).first()
+    res_oral = ResultatEntretien.objects.filter(campagne=c, etudiant=etu).first()
+
+    # Construction de la réponse structurée
+    data = {
+        "etudiant": {
+            "nom": etu.nom,
+            "prenom": etu.prenom,
+            "cne": etu.cne,
+            "filiere": etu.filiere.nom if etu.filiere else "N/A"
+        },
+        "campagne": {
+            "annee": getattr(c, "annee", "En cours"),
+            "titre": str(c)
+        },
+        "statuts": {
+            "passe1": {
+                "traite": p1 is not None,
+                "eligible": p1.eligible if p1 else False,
+                "moyenne": p1.moyenne_a1_sans_pfa if p1 else None,
+                "motif": p1.motif_refus if p1 else None
+            },
+            "passe3_rank": {
+                "traite": p3 is not None,
+                "rang": p3.rang if p3 else None,
+                "score": p3.note_selection if p3 else None,
+                "note_s3": p3.note_s3 if p3 else None
+            },
+            "passe3_fifo": {
+                "traite": aff is not None,
+                "statut": aff.statut if aff else "EN_ATTENTE",
+                "partenaire": aff.partenaire.nom_ecole if (aff and aff.partenaire) else None,
+                "type_mobilite": aff.type_mobilite if aff else None
+            },
+            "passe4_entretien": {
+                "convoque": convoc is not None,
+                "message": convoc.message if convoc else None,
+                "decision_finale": res_oral.decision if res_oral else None # VALIDE / REFUSE
+            }
+        }
+    }
+    return Response(data)
 
 
 @api_view(["GET", "POST"])
@@ -194,3 +273,30 @@ def participants_above(request):
 
     # anonymisé : seulement rang
     return Response([{"rang": x.rang} for x in better], status=status.HTTP_200_OK)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def student_options(request):
+    """Renvoie la liste des écoles/filières disponibles pour cet étudiant"""
+    c = get_active_campaign()
+    etu = Etudiant.objects.filter(user=request.user).first()
+    
+    if not c or not etu:
+        return Response([])
+
+    # On récupère les alignements autorisés pour sa filière
+    alignments = Alignement.objects.filter(
+        campagne=c, 
+        filiere_origine=etu.filiere
+    ).select_related("partenaire")
+
+    data = []
+    for a in alignments:
+        data.append({
+            "id": a.id,
+            "partenaire": a.partenaire.nom_ecole,
+            "filiere_accueil": a.filiere_accueil,
+            "type_mobilite": a.type_mobilite
+        })
+    return Response(data)
