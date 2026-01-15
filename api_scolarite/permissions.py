@@ -1,9 +1,38 @@
 from rest_framework.permissions import BasePermission
 
-def in_group(user, name: str) -> bool:
-    return user and user.is_authenticated and user.groups.filter(name=name).exists()
+class IsScolarite(BasePermission):
+    """
+    Permission stricte : Uniquement pour le rôle 'SCOLARITE'.
+    """
+    def has_permission(self, request, view):
+        # 1. Authentifié ?
+        if not request.user or not request.user.is_authenticated:
+            return False
+        
+        # 2. Superuser (Admin) a toujours accès
+        if request.user.is_superuser:
+            return True
+
+        # 3. Vérification du rôle via le Profile
+        if hasattr(request.user, 'profile'):
+            return request.user.profile.role == 'SCOLARITE'
+        
+        return False
+
 
 class IsScolariteOrSRI(BasePermission):
+    """
+    Permission mixte : Pour 'SCOLARITE' ou 'SRI'.
+    (Je la laisse au cas où tu en aurais besoin pour des vues communes)
+    """
     def has_permission(self, request, view):
-        u = request.user
-        return in_group(u, "SCOLARITE") or in_group(u, "SRI") or u.is_superuser
+        if not request.user or not request.user.is_authenticated:
+            return False
+            
+        if request.user.is_superuser:
+            return True
+
+        if hasattr(request.user, 'profile'):
+            return request.user.profile.role in ['SCOLARITE', 'SRI']
+            
+        return False

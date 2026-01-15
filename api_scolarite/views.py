@@ -253,3 +253,134 @@ def upload_s3_csv(request):
 @permission_classes([AllowAny])
 def upload_notes_csv_old(request):
     return Response({"detail": "Cette route n'existe plus. Utilisez import-csv."}, status=400)
+
+import csv
+import io
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.response import Response
+from .permissions import IsScolarite
+from academic.models import Filiere, Etudiant
+
+# --- 1. GESTION DES EFFECTIFS ---
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsScolarite])
+def manage_effectifs(request):
+    """
+    GET: Renvoie la liste des filières et leur effectif 2A.
+    POST: Met à jour les effectifs.
+    """
+    if request.method == 'GET':
+        data = Filiere.objects.all().values('id', 'nom', 'nombre_inscrits_2a').order_by('nom')
+        return Response(list(data))
+
+    elif request.method == 'POST':
+        # Attend une liste: [{ "id": 1, "nombre": 60 }, { "id": 2, "nombre": 55 }]
+        updates = request.data.get('updates', [])
+        count = 0
+        for item in updates:
+            try:
+                fil = Filiere.objects.get(id=item['id'])
+                fil.nombre_inscrits_2a = int(item['nombre'])
+                fil.save()
+                count += 1
+            except:
+                continue
+        return Response({"message": f"{count} effectifs mis à jour !"}, status=200)
+
+# --- 2. IMPORT NOTES S3 (CSV Simple) ---
+
+@api_view(['POST'])
+@permission_classes([IsScolarite])
+def import_notes_s3(request):
+    """
+    CSV attendu : CNE;Moyenne_S3
+    """
+    file = request.FILES.get('file')
+    if not file: return Response({"detail": "Fichier manquant"}, 400)
+
+    decoded_file = file.read().decode('utf-8').splitlines()
+    reader = csv.reader(decoded_file, delimiter=';')
+    
+    updated = 0
+    errors = 0
+
+    for row in reader:
+        try:
+            # Skip header si présent
+            if "CNE" in row[0].upper(): continue
+            
+            cne = row[0].strip()
+            note_s3 = float(row[1].replace(',', '.'))
+            
+            etu = Etudiant.objects.filter(cne=cne).first()
+            if etu:
+                etu.moyenne_s3 = note_s3
+                etu.save()
+                updated += 1
+        except Exception:
+            errors += 1
+
+    return Response({
+        "message": f"Moyennes S3 importées : {updated} succès, {errors} erreurs."
+    })
+
+# --- 3. IMPORT NOTES 1A & CALCUL SCORE (CSV Complexe) ---
+
+@api_view(['POST'])
+@permission_classes([IsScolarite])
+def import_notes_1a(request):
+    """
+    CSV attendu : CNE;Nom_Module;Type_Module;Note
+    Type_Module : 'TC' ou 'SPEC'
+    """
+    file = request.FILES.get('file')
+    if not file: return Response({"detail": "Fichier manquant"}, 400)
+
+    decoded_file = file.read().decode('utf-8').splitlines()
+    reader = csv.reader(decoded_file, delimiter=';')
+
+    # Structure temporaire pour grouper les notes par CNE
+    # data_temp = { "CNE123": { "TC": [12, 14], "SPEC": [15] } }
+    data_temp = {}
+
+    for row in reader:
+        try:
+            if "CNE" in row[0].upper(): continue # Skip Header
+            
+            cne = row[0].strip()
+            type_mod = row[2].strip().upper() # TC ou SPEC
+            note = float(row[3].replace(',', '.'))
+            
+            if cne not in data_temp:
+                data_temp[cne] = {"TC": [], "SPEC": []}
+            
+            if type_mod in ["TC", "SPEC"]:
+                data_temp[cne][type_mod].append(note)
+                
+        except Exception:
+            continue
+
+    # Calcul des moyennes et sauvegarde
+    updated_count = 0
+    
+    for cne, notes in data_temp.items():
+        etu = Etudiant.objects.filter(cne=cne).first()
+        if etu:
+            # Calcul Moyenne TC
+            if notes["TC"]:
+                moy_tc = sum(notes["TC"]) / len(notes["TC"])
+                etu.moyenne_1a_tc = round(moy_tc, 3)
+            
+            # Calcul Moyenne SPEC
+            if notes["SPEC"]:
+                moy_spec = sum(notes["SPEC"]) / len(notes["SPEC"])
+                etu.moyenne_1a_spec = round(moy_spec, 3)
+            
+            # Le save() du modèle lancera automatiquement le calcul du score_selection
+            etu.save()
+            updated_count += 1
+
+    return Response({
+        "message": f"Notes 1A traitées pour {updated_count} étudiants. Scores calculés."
+    })
