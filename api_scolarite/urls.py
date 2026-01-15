@@ -5,7 +5,7 @@ from .views import (
     import_notes_1a,
     # Assure-toi que ces vues existent aussi dans views.py si tu les utilises :
     import_admin_csv, 
-    import_notes_csv 
+    #import_notes_csv 
 )
 
 urlpatterns = [
@@ -18,5 +18,5 @@ urlpatterns = [
 
     # 3. Imports Legacy (Anciens)
     path('import-admin/', import_admin_csv),
-    path('import-csv/', import_notes_csv),
+    #path('import-csv/', import_notes_csv),
 ]

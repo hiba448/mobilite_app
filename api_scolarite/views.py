@@ -8,9 +8,10 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 
-from academic.models import Etudiant, Module, NoteModule
+from academic.models import Etudiant, Module, NoteModule, Filiere
 from selection.models import DossierEtudiant
 from mobility.models import Campagne
+from .permissions import IsScolarite
 
 # --- FONCTIONS UTILITAIRES ---
 
@@ -28,7 +29,258 @@ def parse_bool(value):
     return clean_val in ['OUI', 'TRUE', '1', 'YES', 'Y', 'VRAI']
 
 # =========================================================
-# 1. IMPORT INFOS ADMINISTRATIVES (Redoublement / Blâme)
+# 1. GESTION DES EFFECTIFS
+# =========================================================
+@api_view(['GET', 'POST'])
+@permission_classes([IsScolarite])
+def manage_effectifs(request):
+    """
+    GET: Renvoie la liste des filières et leur effectif 2A.
+    POST: Met à jour les effectifs.
+    """
+    if request.method == 'GET':
+        data = Filiere.objects.all().values('id', 'nom', 'nombre_inscrits_2a').order_by('nom')
+        return Response(list(data))
+
+    elif request.method == 'POST':
+        # Attend une liste: [{ "id": 1, "nombre": 60 }, { "id": 2, "nombre": 55 }]
+        updates = request.data.get('updates', [])
+        count = 0
+        for item in updates:
+            try:
+                fil = Filiere.objects.get(id=item['id'])
+                fil.nombre_inscrits_2a = int(item['nombre'])
+                fil.save()
+                count += 1
+            except:
+                continue
+        return Response({"message": f"{count} effectifs mis à jour !"}, status=200)
+
+
+# =========================================================
+# 2. IMPORT NOTES S3 (CSV Simple)
+# =========================================================
+@api_view(['POST'])
+@permission_classes([IsScolarite])
+def import_notes_s3(request):
+    """
+    CSV attendu : CNE;Moyenne_S3
+    """
+    file = request.FILES.get('file')
+    if not file: return Response({"detail": "Fichier manquant"}, 400)
+
+    decoded_file = file.read().decode('utf-8').splitlines()
+    reader = csv.reader(decoded_file, delimiter=';')
+    
+    updated = 0
+    errors = 0
+
+    for row in reader:
+        try:
+            # Skip header si présent
+            if "CNE" in row[0].upper(): continue
+            
+            cne = row[0].strip()
+            note_s3 = float(row[1].replace(',', '.'))
+            
+            etu = Etudiant.objects.filter(cne=cne).first()
+            if etu:
+                etu.moyenne_s3 = note_s3
+                etu.save()
+                updated += 1
+        except Exception:
+            errors += 1
+
+    return Response({
+        "message": f"Moyennes S3 importées : {updated} succès, {errors} erreurs."
+    })
+
+
+# =========================================================
+# 3. IMPORT NOTES 1A & CALCUL SCORE (CSV Complexe)
+# =========================================================
+# =========================================================
+# 3. IMPORT NOTES 1A & CALCUL SCORE (CSV Complexe)
+# =========================================================
+@api_view(['POST'])
+@permission_classes([IsScolarite])
+def import_notes_1a(request):
+    """
+    CSV attendu : CNE;Nom_Module;Type_Module;Note
+    Type_Module : 'TC', 'SPEC' ou 'PFA'
+    """
+    file = request.FILES.get('file')
+    if not file: 
+        return Response({"detail": "Fichier manquant"}, status=400)
+
+    campagne = get_active_campagne()
+    if not campagne:
+        return Response({"error": "Aucune campagne active."}, status=400)
+
+    try:
+        decoded_file = file.read().decode('utf-8-sig').splitlines()
+        reader = csv.reader(decoded_file, delimiter=';')
+
+        data_temp = {}  # Pour moyennes TC/SPEC
+        errors = []
+        line_count = 0
+        header_skipped = False
+
+        print("\n--- DÉBUT IMPORT NOTES 1A ---")
+
+        with transaction.atomic():
+            for i, row in enumerate(reader, start=1):
+                print(f"\n🔍 Ligne {i}: {row}")
+                
+                try:
+                    # Skip si ligne vide
+                    if not row or len(row) == 0:
+                        print(f"   ⏭ Ligne vide")
+                        continue
+                    
+                    if len(row) < 4:
+                        print(f"   ⚠ Ligne incomplète ({len(row)} colonnes)")
+                        errors.append(f"Ligne {i}: seulement {len(row)} colonnes")
+                        continue
+                    
+                    # Skip Header UNIQUEMENT LA PREMIÈRE FOIS
+                    first_cell = str(row[0]).strip().upper()
+                    if not header_skipped and ("CNE" == first_cell or "ETUDIANT" in first_cell):
+                        print(f"   📋 Header ignoré")
+                        header_skipped = True
+                        continue
+                    
+                    cne = row[0].strip()
+                    nom_module = row[1].strip()
+                    type_mod = row[2].strip().upper()
+                    note_raw = row[3].strip()
+                    
+                    print(f"   CNE='{cne}' | Module='{nom_module}' | Type='{type_mod}' | Note='{note_raw}'")
+                    
+                    # Vérification CNE non vide
+                    if not cne:
+                        print(f"   ⚠ CNE vide")
+                        continue
+                    
+                    # Conversion de la note
+                    try:
+                        note = float(note_raw.replace(',', '.'))
+                    except ValueError:
+                        print(f"   ❌ Note invalide: '{note_raw}'")
+                        errors.append(f"Ligne {i}: Note invalide '{note_raw}'")
+                        continue
+                    
+                    print(f"   ✓ Note convertie: {note}")
+                    
+                    # Récupération de l'étudiant
+                    etu = Etudiant.objects.filter(cne=cne).first()
+                    if not etu:
+                        print(f"   ❌ CNE '{cne}' introuvable")
+                        errors.append(f"Ligne {i}: CNE '{cne}' introuvable")
+                        continue
+                    
+                    # === NOUVEAU : Création du Module et de la Note ===
+                    module, _ = Module.objects.get_or_create(
+                        nom=nom_module,
+                        defaults={
+                            'is_pfa': (type_mod == 'PFA'),
+                            'is_tc': (type_mod == 'TC'),
+                            'is_specialite': (type_mod == 'SPEC')
+                        }
+                    )
+                    
+                    # Création/Mise à jour de la note dans NoteModule
+                    NoteModule.objects.update_or_create(
+                        campagne=campagne,
+                        etudiant=etu,
+                        module=module,
+                        defaults={'note': note}
+                    )
+                    print(f"   💾 NoteModule créée/mise à jour")
+                    # === FIN NOUVEAU ===
+                    
+                    # Initialisation du dict pour calcul moyennes TC/SPEC
+                    if cne not in data_temp:
+                        data_temp[cne] = {"TC": [], "SPEC": [], "etudiant": etu}
+                    
+                    # Ajout de la note selon le type (pour calcul moyennes)
+                    if type_mod in ["TC", "SPEC"]:
+                        data_temp[cne][type_mod].append(note)
+                        line_count += 1
+                        print(f"   ✅ Ajouté: {cne} -> {type_mod} = {note}")
+                    elif type_mod == "PFA":
+                        line_count += 1
+                        print(f"   ✅ PFA ajouté: {cne} = {note}")
+                    else:
+                        print(f"   ⚠ Type invalide '{type_mod}' (attendu: TC, SPEC ou PFA)")
+                        
+                except Exception as e:
+                    errors.append(f"Ligne {i}: {str(e)}")
+                    print(f"   ❌ Erreur: {e}")
+
+            print(f"\n{'=' * 80}")
+            print(f"RÉSUMÉ PARSING :")
+            print(f"  Lignes de notes traitées : {line_count}")
+            print(f"  Étudiants uniques : {len(data_temp)}")
+            print(f"{'=' * 80}\n")
+
+            # Calcul des moyennes TC/SPEC et sauvegarde dans Etudiant
+            updated_count = 0
+            
+            print("CALCUL MOYENNES TC/SPEC :")
+            
+            for cne, data in data_temp.items():
+                etu = data["etudiant"]
+                notes_tc = data["TC"]
+                notes_spec = data["SPEC"]
+                
+                print(f"\n🔍 CNE: '{cne}'")
+                updated = False
+                
+                # Calcul Moyenne TC
+                if notes_tc:
+                    moy_tc = sum(notes_tc) / len(notes_tc)
+                    etu.moyenne_1a_tc = round(moy_tc, 3)
+                    updated = True
+                    print(f"   📊 Moyenne TC: {moy_tc:.3f} (sur {len(notes_tc)} notes)")
+                
+                # Calcul Moyenne SPEC
+                if notes_spec:
+                    moy_spec = sum(notes_spec) / len(notes_spec)
+                    etu.moyenne_1a_spec = round(moy_spec, 3)
+                    updated = True
+                    print(f"   📊 Moyenne SPEC: {moy_spec:.3f} (sur {len(notes_spec)} notes)")
+                
+                if updated:
+                    etu.save()
+                    updated_count += 1
+                    print(f"   💾 Étudiant sauvegardé")
+
+            print(f"\n{'=' * 80}")
+            print(f"RÉSULTAT FINAL : {updated_count} étudiants mis à jour")
+            print(f"{'=' * 80}")
+
+        response_data = {
+            "message": f"Notes 1A traitées pour {updated_count} étudiants. Scores calculés.",
+            "details": {
+                "lignes_traitees": line_count,
+                "etudiants_uniques": len(data_temp),
+                "etudiants_mis_a_jour": updated_count
+            }
+        }
+        
+        if errors:
+            response_data["errors"] = errors[:20]
+
+        return Response(response_data, status=200)
+
+    except Exception as e:
+        print(f"\n❌ ERREUR CRITIQUE: {e}")
+        import traceback
+        traceback.print_exc()
+        return Response({"detail": str(e)}, status=500)
+# =========================================================
+# 4. IMPORT INFOS ADMINISTRATIVES (Redoublement / Blâme)
 # =========================================================
 @api_view(["POST"])
 @permission_classes([AllowAny]) 
@@ -110,8 +362,9 @@ def import_admin_csv(request):
 
 
 # =========================================================
-# 2. IMPORT NOTES (Académique pur)
+# 5. IMPORT NOTES (Académique pur)
 # =========================================================
+'''
 @api_view(["POST"])
 @permission_classes([AllowAny]) 
 @parser_classes([MultiPartParser, FormParser])
@@ -191,196 +444,4 @@ def import_notes_csv(request):
     except Exception as e:
         print(f"ERREUR CRITIQUE NOTES: {e}")
         return Response({"error": str(e)}, status=500)
-
-
-# =========================================================
-# 3. IMPORT S3 (Passe 3)
-# =========================================================
-@api_view(["POST"])
-@permission_classes([AllowAny])
-def upload_s3_csv(request):
-    """
-    Format : cne,moy_s3_avant_rattrapage (virgule ou point-virgule acceptés)
-    """
-    campagne = get_active_campagne()
-    if not campagne: return Response({"detail": "Aucune campagne active."}, status=400)
-
-    f = request.FILES.get("file")
-    if not f: return Response({"detail": "Fichier manquant."}, status=400)
-
-    try:
-        data = f.read().decode("utf-8-sig")
-        # Petite astuce pour gérer virgule ET point-virgule
-        if ';' in data.splitlines()[0]:
-            reader = csv.DictReader(io.StringIO(data), delimiter=';')
-        else:
-            reader = csv.DictReader(io.StringIO(data), delimiter=',')
-
-        # Nettoyage header
-        if reader.fieldnames:
-            reader.fieldnames = [name.strip() for name in reader.fieldnames]
-
-        updated = 0
-        with transaction.atomic():
-            for row in reader:
-                # On cherche la clé insensible à la casse
-                cne_key = next((k for k in row.keys() if k.lower() == 'cne'), None)
-                moy_key = next((k for k in row.keys() if 'moy' in k.lower()), None)
-
-                if not cne_key or not moy_key: continue
-
-                cne = row[cne_key].strip()
-                moy_raw = row[moy_key].strip().replace(",", ".")
-
-                if cne and moy_raw:
-                    etu = Etudiant.objects.filter(cne=cne).first()
-                    if etu:
-                        DossierEtudiant.objects.update_or_create(
-                            etudiant=etu, campagne=campagne,
-                            defaults={"moyenne_s3_avant_rattrapage": float(moy_raw)}
-                        )
-                        updated += 1
-        
-        return Response({"ok": True, "created": updated}, status=200)
-    except Exception as e:
-        return Response({"detail": str(e)}, status=500)
-
-
-# =========================================================
-# 4. ROUTE OBSOLÈTE (Pour éviter les crashs d'URL)
-# =========================================================
-@api_view(["POST"])
-@permission_classes([AllowAny])
-def upload_notes_csv_old(request):
-    return Response({"detail": "Cette route n'existe plus. Utilisez import-csv."}, status=400)
-
-import csv
-import io
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.response import Response
-from .permissions import IsScolarite
-from academic.models import Filiere, Etudiant
-
-# --- 1. GESTION DES EFFECTIFS ---
-
-@api_view(['GET', 'POST'])
-@permission_classes([IsScolarite])
-def manage_effectifs(request):
-    """
-    GET: Renvoie la liste des filières et leur effectif 2A.
-    POST: Met à jour les effectifs.
-    """
-    if request.method == 'GET':
-        data = Filiere.objects.all().values('id', 'nom', 'nombre_inscrits_2a').order_by('nom')
-        return Response(list(data))
-
-    elif request.method == 'POST':
-        # Attend une liste: [{ "id": 1, "nombre": 60 }, { "id": 2, "nombre": 55 }]
-        updates = request.data.get('updates', [])
-        count = 0
-        for item in updates:
-            try:
-                fil = Filiere.objects.get(id=item['id'])
-                fil.nombre_inscrits_2a = int(item['nombre'])
-                fil.save()
-                count += 1
-            except:
-                continue
-        return Response({"message": f"{count} effectifs mis à jour !"}, status=200)
-
-# --- 2. IMPORT NOTES S3 (CSV Simple) ---
-
-@api_view(['POST'])
-@permission_classes([IsScolarite])
-def import_notes_s3(request):
-    """
-    CSV attendu : CNE;Moyenne_S3
-    """
-    file = request.FILES.get('file')
-    if not file: return Response({"detail": "Fichier manquant"}, 400)
-
-    decoded_file = file.read().decode('utf-8').splitlines()
-    reader = csv.reader(decoded_file, delimiter=';')
-    
-    updated = 0
-    errors = 0
-
-    for row in reader:
-        try:
-            # Skip header si présent
-            if "CNE" in row[0].upper(): continue
-            
-            cne = row[0].strip()
-            note_s3 = float(row[1].replace(',', '.'))
-            
-            etu = Etudiant.objects.filter(cne=cne).first()
-            if etu:
-                etu.moyenne_s3 = note_s3
-                etu.save()
-                updated += 1
-        except Exception:
-            errors += 1
-
-    return Response({
-        "message": f"Moyennes S3 importées : {updated} succès, {errors} erreurs."
-    })
-
-# --- 3. IMPORT NOTES 1A & CALCUL SCORE (CSV Complexe) ---
-
-@api_view(['POST'])
-@permission_classes([IsScolarite])
-def import_notes_1a(request):
-    """
-    CSV attendu : CNE;Nom_Module;Type_Module;Note
-    Type_Module : 'TC' ou 'SPEC'
-    """
-    file = request.FILES.get('file')
-    if not file: return Response({"detail": "Fichier manquant"}, 400)
-
-    decoded_file = file.read().decode('utf-8').splitlines()
-    reader = csv.reader(decoded_file, delimiter=';')
-
-    # Structure temporaire pour grouper les notes par CNE
-    # data_temp = { "CNE123": { "TC": [12, 14], "SPEC": [15] } }
-    data_temp = {}
-
-    for row in reader:
-        try:
-            if "CNE" in row[0].upper(): continue # Skip Header
-            
-            cne = row[0].strip()
-            type_mod = row[2].strip().upper() # TC ou SPEC
-            note = float(row[3].replace(',', '.'))
-            
-            if cne not in data_temp:
-                data_temp[cne] = {"TC": [], "SPEC": []}
-            
-            if type_mod in ["TC", "SPEC"]:
-                data_temp[cne][type_mod].append(note)
-                
-        except Exception:
-            continue
-
-    # Calcul des moyennes et sauvegarde
-    updated_count = 0
-    
-    for cne, notes in data_temp.items():
-        etu = Etudiant.objects.filter(cne=cne).first()
-        if etu:
-            # Calcul Moyenne TC
-            if notes["TC"]:
-                moy_tc = sum(notes["TC"]) / len(notes["TC"])
-                etu.moyenne_1a_tc = round(moy_tc, 3)
-            
-            # Calcul Moyenne SPEC
-            if notes["SPEC"]:
-                moy_spec = sum(notes["SPEC"]) / len(notes["SPEC"])
-                etu.moyenne_1a_spec = round(moy_spec, 3)
-            
-            # Le save() du modèle lancera automatiquement le calcul du score_selection
-            etu.save()
-            updated_count += 1
-
-    return Response({
-        "message": f"Notes 1A traitées pour {updated_count} étudiants. Scores calculés."
-    })
+'''

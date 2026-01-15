@@ -4,6 +4,7 @@ from django.contrib.auth.models import User
 class Filiere(models.Model):
     nom = models.CharField(max_length=255, unique=True)
     
+    
     # ✅ AJOUT PHASE 3 : Effectif total pour le calcul des 10% et 30%
     nombre_inscrits_2a = models.PositiveIntegerField(
         default=0, 
@@ -50,6 +51,7 @@ class Etudiant(models.Model):
     def save(self, *args, **kwargs):
         # ✅ CALCUL AUTOMATIQUE DU SCORE
         # Dès qu'on sauvegarde l'étudiant, si les notes sont là, on met à jour le score.
+        
         if self.moyenne_1a_tc is not None and self.moyenne_1a_spec is not None:
             self.score_selection = round((0.8 * self.moyenne_1a_tc) + (0.2 * self.moyenne_1a_spec), 3)
         super().save(*args, **kwargs)
