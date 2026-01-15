@@ -19,21 +19,30 @@ class Partenaire(models.Model):
         return self.nom_ecole
 
 
+# Dans mobility/models.py
+
 class OffrePartenaire(models.Model):
     campagne = models.ForeignKey(Campagne, on_delete=models.CASCADE)
     partenaire = models.ForeignKey(Partenaire, on_delete=models.CASCADE)
-    filiere_origine = models.ForeignKey('academic.Filiere', on_delete=models.CASCADE)
+    
+    # ✅ CHANGEMENT ICI : ManyToManyField (Plusieurs filières possibles)
+    filieres_ensias = models.ManyToManyField(
+        'academic.Filiere', 
+        blank=True,
+        related_name='offres_partenaire'
+    )
+    
     filiere_accueil = models.CharField(max_length=255)
     nb_places_ec = models.PositiveIntegerField(default=0)
     nb_places_dd = models.PositiveIntegerField(default=0)
 
     class Meta:
-        unique_together = ('campagne', 'partenaire', 'filiere_origine', 'filiere_accueil')
+        ordering = ['partenaire', 'filiere_accueil']
 
     def __str__(self):
-        return f"{self.partenaire} - {self.filiere_origine} ({self.campagne})"
-
-
+        return f"{self.partenaire} -> {self.filiere_accueil}"
+    
+    
 class Desiderata(models.Model):
     TYPE_CHOIX = [
         ('EC', 'Echange'),

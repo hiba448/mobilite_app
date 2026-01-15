@@ -13,12 +13,21 @@ class Profile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.STUDENT)
 
-    # ✅ ICI, en dehors de Role
+    # Pour les Coordinateurs de Filière (CF)
     filiere = models.ForeignKey(
         "academic.Filiere",
         null=True,
         blank=True,
         on_delete=models.SET_NULL
+    )
+
+    # ✅ AJOUT DU CHAMP MANQUANT (Pour les Partenaires)
+    partenaire = models.OneToOneField(
+        "mobility.Partenaire",  # On utilise le string pour éviter les erreurs d'import
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="profile_partenaire"
     )
 
     def __str__(self):

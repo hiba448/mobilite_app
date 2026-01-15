@@ -20,6 +20,9 @@ from .views import (
     comite_dashboard,
     comite_save_note,
     sri_reset_campaign,
+    manage_params,
+    get_all_filieres,
+    manage_matrix,
 )
 
 urlpatterns = [
@@ -34,6 +37,7 @@ urlpatterns = [
 
     # ✅ route générique (tu peux la garder aussi)
     path("run/<str:cmd_name>/", sri_run_command),
+    
 
     path("desiderata/open/", sri_open_desiderata),
     path("desiderata/close/", sri_close_desiderata),
@@ -41,4 +45,7 @@ urlpatterns = [
     path("reset-all/", sri_reset_campaign),
     path("comite/dashboard/", comite_dashboard),
     path("comite/save/", comite_save_note),
+    path('params/', manage_params),
+    path('filieres/', get_all_filieres),
+    path('matrix/', manage_matrix),
 ]
